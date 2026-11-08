@@ -6,6 +6,8 @@ import phBotChat
 import time
 import sqlite3
 import glob
+import urllib.request
+import re
 
 # ============================================================
 # ============================================================
@@ -67,6 +69,9 @@ tab1 = QtBind.init(__name__, Plugin)
 
 x = -1
 y = 0
+
+# Version oben rechts anzeigen
+lbl_version = QtBind.createLabel(tab1, 'Version: ' + PluginVersion, 550, 10)
 
 QtBind.createLabel(
     tab1,
@@ -3427,6 +3432,30 @@ def handle_event(t, data):
         area_change_death_remaining = DEATH_WAIT_TIMEOUT
         log('%s: Character died during area change. Maximum recovery wait is %d seconds.' % (Plugin, DEATH_WAIT_TIMEOUT))
         schedule_area_change(1.0)
+
+# ============================================================
+# Update Checker
+# ============================================================
+def check_for_update():
+    try:
+        # Den Raw-Code von GitHub abfragen
+        url = "https://raw.githubusercontent.com/chefkoch1837/phBot/main/BetterTraining.py"
+        req = urllib.request.Request(url, headers={'User-Agent': 'Mozilla/5.0'})
+        with urllib.request.urlopen(req, timeout=5) as response:
+            content = response.read().decode('utf-8')
+            # PluginVersion aus dem GitHub-Code auslesen
+            match = re.search(r"PluginVersion\s*=\s*['\"]([^'\"]+)['\"]", content)
+            if match:
+                online_version = match.group(1)
+                # Versionen vergleichen
+                if online_version != PluginVersion:
+                    log('%s: new version avaleble [%s > %s] code on' % (Plugin, PluginVersion, online_version))
+                    log('https://github.com/chefkoch1837/phBot/blob/main/BetterTraining.py')
+                    
+                    # Das Label oben rechts im UI aktualisieren!
+                    QtBind.setText(tab1, lbl_version, 'new version avaleble [%s > %s]' % (PluginVersion, online_version))
+    except Exception as ex:
+        pass
 
 def event_loop():
     global buy_items_pending
