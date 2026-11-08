@@ -12,7 +12,7 @@ import re
 # ============================================================
 # ============================================================
 Plugin = 'BetterTraining'
-PluginVersion = '0.99'
+PluginVersion = '1.00'
 
 # ============================================================
 # Globals
@@ -70,8 +70,10 @@ tab1 = QtBind.init(__name__, Plugin)
 x = -1
 y = 0
 
-# Version oben rechts anzeigen
-lbl_version = QtBind.createLabel(tab1, 'Version: ' + PluginVersion, 550, 10)
+
+
+lbl_version = QtBind.createLabel(tab1, '                                      Version: v' + PluginVersion + '            ', 538, -2)
+
 
 QtBind.createLabel(
     tab1,
@@ -1681,7 +1683,7 @@ calc_y = 145
 
 QtBind.createLabel(tab2, '<b>SP Gap Calculator</b>', 5, calc_y)
 
-calc_live_btn = QtBind.createButton(tab2, 'calc_get_live_stats_clicked', 'Get Live Stats', 208, calc_y - 2)
+calc_live_btn = QtBind.createButton(tab2, 'calc_get_live_stats_clicked', 'Get Live Stats', 208, calc_y + 80)
 
 QtBind.createLabel(tab2, 'Current Skill Points:', 5, calc_y + 25)
 calc_cur_sp_edit = QtBind.createLineEdit(tab2, '0', 134, calc_y + 22, 70, 20)
@@ -3433,29 +3435,57 @@ def handle_event(t, data):
         log('%s: Character died during area change. Maximum recovery wait is %d seconds.' % (Plugin, DEATH_WAIT_TIMEOUT))
         schedule_area_change(1.0)
 
+
 # ============================================================
 # Update Checker
 # ============================================================
 def check_for_update():
+    import urllib.request
+    import re
+    import ssl
+    
     try:
-        # Den Raw-Code von GitHub abfragen
-        url = "https://raw.githubusercontent.com/chefkoch1837/phBot/main/BetterTraining.py"
+        ctx = ssl.create_default_context()
+        ctx.check_hostname = False
+        ctx.verify_mode = ssl.CERT_NONE
+
+        url = "https://raw.githubusercontent.com/chefkoch1837/phBot/main/BetterTraining.py?t=" + str(int(time.time()))
         req = urllib.request.Request(url, headers={'User-Agent': 'Mozilla/5.0'})
-        with urllib.request.urlopen(req, timeout=5) as response:
+        
+        with urllib.request.urlopen(req, timeout=5, context=ctx) as response:
             content = response.read().decode('utf-8')
-            # PluginVersion aus dem GitHub-Code auslesen
+            
             match = re.search(r"PluginVersion\s*=\s*['\"]([^'\"]+)['\"]", content)
             if match:
-                online_version = match.group(1)
-                # Versionen vergleichen
-                if online_version != PluginVersion:
-                    log('%s: new version avaleble [%s > %s] code on' % (Plugin, PluginVersion, online_version))
-                    log('https://github.com/chefkoch1837/phBot/blob/main/BetterTraining.py')
+                online_version_str = match.group(1).strip()
+                
+                # Hilfsfunktion: Macht aus "1.1.2 Beta" -> [1, 1, 2]
+                def parse_v(v_str):
+                    v_match = re.search(r'([0-9]+(?:\.[0-9]+)*)', v_str)
+                    if v_match:
+                        return [int(x) for x in v_match.group(1).split('.')]
+                    return [0]
+
+                online_v = parse_v(online_version_str)
+                local_v = parse_v(PluginVersion)
+                
+                if online_v > local_v:
+                    msg = 'New version available: v%s > v%s' % (PluginVersion, online_version_str)
+                    log('%s: %s' % (Plugin, msg))
+                    log('BetterTraining: https://github.com/chefkoch1837/phBot/blob/main/BetterTraining.py')
                     
-                    # Das Label oben rechts im UI aktualisieren!
-                    QtBind.setText(tab1, lbl_version, 'new version avaleble [%s > %s]' % (PluginVersion, online_version))
+                    # Hier ändern wir den Text des Labels und füllen ihn auf 60 Zeichen auf
+                    try:
+                        QtBind.setText(tab1, lbl_version, msg.ljust(60))
+                    except Exception as ui_ex:
+                        log('%s: Could not update UI label: %s' % (Plugin, ui_ex))
+                else:
+                    log('%s: Plugin is up to date.' % Plugin)
+            else:
+                log('%s: Update Check - Could not find PluginVersion in online file.' % Plugin)
+                
     except Exception as ex:
-        pass
+        log('%s: Update Check failed: %s' % (Plugin, str(ex)))
 
 def event_loop():
     global buy_items_pending
@@ -3474,6 +3504,7 @@ def event_loop():
 # ============================================================
 load_config()
 Timer(2.0, load_character_settings_when_ready, []).start()
+Timer(5.0, check_for_update, []).start()  # <--- DIESE ZEILE HINZUFÜGEN
 
 log('Plugin: %s by Chefkoch, Inspired by Bine11 AutoTraining' % Plugin)
 log('Plugin: %s v%s successfully loaded!' % (Plugin, PluginVersion))
