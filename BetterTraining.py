@@ -8,11 +8,13 @@ import sqlite3
 import glob
 import urllib.request
 import re
+import json
+import random
 
 # ============================================================
 # ============================================================
 Plugin = 'BetterTraining'
-PluginVersion = '1.00'
+PluginVersion = '1.01'
 
 # ============================================================
 # Globals
@@ -22,6 +24,13 @@ solo = False
 members = 8
 levelOffset = 0
 spots = []
+spots_by_section = {'Spots': []}
+spot_mode = 'global'
+cached_db_path = None
+client_db3_cache = {}
+hometown_master_check = None
+config_last_mtime = None
+last_mtime_check = 0.0
 use_monstername_as_name = False
 use_mob_level = False
 
@@ -182,12 +191,28 @@ buttonDelete = QtBind.createButton(
 # Spot List
 # ============================================================
 listX = 230
-listY = 5
+listY = 0
 
 QtBind.createLabel(
     tab1,
-    'Training Spots:',
+    '<b>Spots:</b>',
     listX,
+    listY + 5
+)
+
+checkGlobalSpots = QtBind.createCheckBox(
+    tab1,
+    'checkGlobalSpots_clicked',
+    'Global Spots',
+    listX + 50,
+    listY
+)
+
+checkServerSpots = QtBind.createCheckBox(
+    tab1,
+    'checkServerSpots_clicked',
+    'Server based Spots',
+    listX + 140,
     listY
 )
 
@@ -208,7 +233,7 @@ spotList = QtBind.createList(
 )
 
 # ============================================================
-# Action Buttons (Walk, Stop)
+# Action Buttons (Walk, Stop, Refresh Spots)
 # ============================================================
 settingsY = 155
 
@@ -230,6 +255,14 @@ editMembers = QtBind.createLineEdit(
     settingsY - 3,
     30,
     20
+)
+
+btn_refresh_spots = QtBind.createButton(
+    tab1,
+    'btn_refresh_spots_clicked',
+    ' Refresh Spots ',
+    125,
+    settingsY - 3
 )
 
 settingsY += 24
@@ -370,12 +403,170 @@ def get_character_key(character=None, server=None):
         return None
     return '%s_%s' % (server, character)
 
+def _normalize_sro_path(p):
+    if not p:
+        return ''
+    s = os.path.normpath(str(p)).replace('\\', '/').rstrip('/').lower()
+    if s.endswith('.exe') or s.endswith('.bin'):
+        last_slash = s.rfind('/')
+        if last_slash != -1:
+            s = s[:last_slash]
+    return s
+
+def _get_candidate_data_dirs():
+    dirs = []
+    try:
+        plugin_dir = os.path.dirname(os.path.abspath(__file__))
+        d1 = os.path.abspath(os.path.join(plugin_dir, '..', 'Data'))
+        if os.path.exists(d1) and d1 not in dirs:
+            dirs.append(d1)
+    except Exception:
+        pass
+    try:
+        cfg_dir = get_config_dir()
+        if cfg_dir:
+            d2 = os.path.abspath(os.path.join(cfg_dir, '..', 'Data'))
+            if os.path.exists(d2) and d2 not in dirs:
+                dirs.append(d2)
+    except Exception:
+        pass
+    for d in [r'C:\SRO\BOT\phBot Testing\Data']:
+        if os.path.exists(d) and d not in dirs:
+            dirs.append(d)
+    return dirs
+
+def find_client_db3_path(client_path=None):
+    global cached_db_path
+    global client_db3_cache
+
+    if not client_path:
+        try:
+            client = get_client() or {}
+            client_path = client.get('path', '')
+        except Exception:
+            client_path = ''
+
+    client_norm = _normalize_sro_path(client_path) if client_path else ''
+
+    if client_norm and client_norm in client_db3_cache:
+        cached = client_db3_cache[client_norm]
+        if cached and os.path.exists(cached):
+            cached_db_path = cached
+            return cached
+
+    data_dirs = _get_candidate_data_dirs()
+    candidates = []
+    for d in data_dirs:
+        for f in glob.glob(os.path.join(d, '*.db3')):
+            base_lower = os.path.basename(f).lower()
+            if base_lower.startswith('login') or f in candidates:
+                continue
+            candidates.append(f)
+
+    try:
+        candidates.sort(key=os.path.getmtime, reverse=True)
+    except Exception:
+        pass
+
+    if client_norm:
+        for candidate in candidates:
+            try:
+                conn = sqlite3.connect(candidate)
+                row = conn.execute("SELECT v FROM data WHERE k='path' LIMIT 1").fetchone()
+                conn.close()
+                if row and row[0]:
+                    db_norm = _normalize_sro_path(row[0])
+                    if (db_norm == client_norm or
+                        client_norm.startswith(db_norm + '/') or
+                        db_norm.startswith(client_norm + '/')):
+                        client_db3_cache[client_norm] = candidate
+                        cached_db_path = candidate
+                        return candidate
+            except Exception:
+                pass
+
+    if current_character and current_character in character_settings:
+        last_db = character_settings[current_character].get('last_server_db')
+        if last_db:
+            for candidate in candidates:
+                if os.path.basename(candidate).lower() == str(last_db).strip().lower():
+                    cached_db_path = candidate
+                    return candidate
+
+    if len(candidates) == 1:
+        return candidates[0]
+
+    return None
+
+def get_server_db_filename():
+    db_path = find_client_db3_path()
+    if db_path:
+        return os.path.basename(db_path)
+    if current_character and current_character in character_settings:
+        last_db = character_settings[current_character].get('last_server_db')
+        if last_db:
+            return str(last_db).strip()
+    return None
+
+def get_active_spot_section():
+    if spot_mode == 'server':
+        db_file = get_server_db_filename()
+        if db_file:
+            return 'Spots_' + db_file
+        server = get_server_name()
+        if server and server != 'UnknownServer':
+            return 'Spots_' + server + '.db3'
+        return 'Spots_server.db3'
+    return 'Spots'
+
+def update_spot_mode_label():
+    pass
+
+def update_active_spots():
+    global spots
+    active_sec = get_active_spot_section()
+    if active_sec not in spots_by_section:
+        spots_by_section[active_sec] = []
+    spots = spots_by_section[active_sec]
+    spots.sort(key=lambda s: (s['level'], s['race']))
+    refresh_spot_list()
+    update_spot_mode_label()
+
+def set_spot_mode(mode):
+    global spot_mode
+    mode = 'server' if str(mode).lower() == 'server' else 'global'
+    spot_mode = mode
+    QtBind.setChecked(tab1, checkGlobalSpots, spot_mode == 'global')
+    QtBind.setChecked(tab1, checkServerSpots, spot_mode == 'server')
+    update_active_spots()
+    save_character_settings()
+    save_config()
+    log('%s: Switched to %s: [%s]' % (Plugin, 'Global Spots' if spot_mode == 'global' else 'Server based Spots', get_active_spot_section()))
+
+def checkGlobalSpots_clicked(checked):
+    if loading_character_settings:
+        return
+    if not checked and spot_mode == 'global':
+        QtBind.setChecked(tab1, checkGlobalSpots, True)
+        return
+    set_spot_mode('global')
+
+def checkServerSpots_clicked(checked):
+    if loading_character_settings:
+        return
+    if not checked and spot_mode == 'server':
+        QtBind.setChecked(tab1, checkServerSpots, True)
+        return
+    set_spot_mode('server')
+
 # ============================================================
 # Default Character Settings
 # ============================================================
 def get_default_character_settings():
     return {
         'enabled': False,
+        'spot_mode': 'global',
+        'last_server_db': '',
         'solo': False,
         'members': 8,
         'levelOffset': 0,
@@ -404,6 +595,7 @@ def finish_loading_character_settings():
 def load_character_settings():
     global loading_character_settings
     global enabled
+    global spot_mode
     global solo
     global members
     global levelOffset
@@ -448,6 +640,11 @@ def load_character_settings():
 
     settings = character_settings[character]
     enabled = settings['enabled']
+    spot_mode_saved = settings.get('spot_mode', 'global')
+    spot_mode = 'server' if str(spot_mode_saved).lower() == 'server' else 'global'
+    QtBind.setChecked(tab1, checkGlobalSpots, spot_mode == 'global')
+    QtBind.setChecked(tab1, checkServerSpots, spot_mode == 'server')
+
     hometown_enabled = bool(settings.get('hometown_enabled', True))
     buy_items_enabled = bool(settings.get('buy_items_enabled', False))
     buy_keep_town_gold_enabled = bool(settings.get('buy_keep_town_gold_enabled', False))
@@ -486,6 +683,8 @@ def load_character_settings():
     if 'tab2' in globals():
         _hometown_refresh_tab1()
 
+    update_active_spots()
+
     auto_settings_signature = None
     Timer(1.0, finish_loading_character_settings, []).start()
     if migrated_legacy_runtime:
@@ -509,6 +708,10 @@ def save_character_settings():
     )
 
     settings['enabled'] = enabled
+    settings['spot_mode'] = spot_mode
+    db_file = get_server_db_filename()
+    if db_file:
+        settings['last_server_db'] = db_file
     settings['solo'] = solo
     settings['members'] = members
     settings['levelOffset'] = levelOffset
@@ -565,6 +768,14 @@ def btn_stop_clicked():
     stop_trace()
     stop_trade()
     log('%s: All actions stopped by user.' % Plugin)
+
+def btn_refresh_spots_clicked():
+    try:
+        _reload_spots_from_disk()
+        total_spots_count = sum(len(s) for s in spots_by_section.values())
+        log('%s: Spots successfully refreshed from file. Total spots: %d' % (Plugin, total_spots_count))
+    except Exception as ex:
+        log('%s: Error refreshing spots: %s' % (Plugin, ex))
 
 # ============================================================
 # Tab 1 Callbacks
@@ -715,7 +926,7 @@ def format_xcontrol_command(template, spot):
         ('%Range', values['Range']),
         ('%X%', values['x']),
         ('%Y%', values['y']),
-        ('%R%', values['r']),
+        ('%R%', values['R']),
         ('%Z%', values['z']),
         ('x%', values['x']),
         ('y%', values['y']),
@@ -956,28 +1167,29 @@ def addSpot_clicked():
         'z': pos_z,
         'radius': radius
     }
-    spots.append(spot)
-    spots.sort(key=lambda s: (s['level'], s['race']))
+    active_sec = get_active_spot_section()
+    sec_spots = spots_by_section.setdefault(active_sec, [])
+    sec_spots.append(spot)
+    sec_spots.sort(key=lambda s: (s['level'], s['race']))
+    update_active_spots()
     save_config()
-    refresh_spot_list()
-    log('%s: Added spot [%s] Race=%s Level=%d Region=%d X=%d Y=%d Z=%d Range=%d' %
-        (Plugin, name, race, level, region, pos_x, pos_y, pos_z, radius))
+    log('%s: Added spot [%s] to [%s] Race=%s Level=%d Region=%d X=%d Y=%d Z=%d Range=%d' %
+        (Plugin, name, active_sec, race, level, region, pos_x, pos_y, pos_z, radius))
     QtBind.setText(tab1, editName, '')
     QtBind.setText(tab1, editLevel, '1')
     QtBind.setText(tab1, editRange, '50')
 
 def deleteSpot_clicked():
+    active_sec = get_active_spot_section()
+    sec_spots = spots_by_section.setdefault(active_sec, [])
     index = QtBind.currentIndex(tab1, spotList)
-    if index < 0:
+    if index < 0 or index >= len(sec_spots):
         log('%s: Please select a spot first!' % Plugin)
         return
-    if index >= len(spots):
-        return
-    spot = spots[index]
-    log('%s: Deleting spot [%s]' % (Plugin, spot['name']))
-    del spots[index]
+    deleted_spot = sec_spots.pop(index)
+    update_active_spots()
     save_config()
-    refresh_spot_list()
+    log('%s: Deleting spot [%s] from [%s]' % (Plugin, deleted_spot['name'], active_sec))
 
 def refresh_spot_list():
     QtBind.clear(tab1, spotList)
@@ -1295,119 +1507,295 @@ def check_party():
 # ============================================================
 # Save & Load Configuration File
 # ============================================================
+def _sanitize_spot(s):
+    if not isinstance(s, dict):
+        return None
+    try:
+        race = str(s.get('race', 'All')).strip()
+        if race not in ('Chinese', 'Europe', 'All'):
+            race = 'All'
+        level = max(1, min(255, int(s.get('level', 1))))
+        name = str(s.get('name', 'Unnamed')).strip() or 'Unnamed'
+        r = int(s.get('r', 0))
+        x = int(s.get('x', 0))
+        y = int(s.get('y', 0))
+        z = int(s.get('z', 0))
+        radius = max(0, min(255, int(s.get('radius', 50))))
+        return {
+            'race': race,
+            'level': level,
+            'name': name,
+            'r': r,
+            'x': x,
+            'y': y,
+            'z': z,
+            'radius': radius
+        }
+    except Exception:
+        return None
+
+def _merge_external_config():
+    global config_last_mtime
+    global spots_by_section
+    global character_settings
+    if not os.path.exists(CONFIG_FILE):
+        return
+    try:
+        current_mtime = os.path.getmtime(CONFIG_FILE)
+    except Exception:
+        return
+    if config_last_mtime is not None and current_mtime <= config_last_mtime:
+        return
+
+    try:
+        with open(CONFIG_FILE, 'r', encoding='utf-8') as f:
+            lines = f.readlines()
+        section = ''
+        character = None
+        new_chars = {}
+        loaded_hometown = {}
+        for raw_line in lines:
+            line = raw_line.strip()
+            if not line or line.startswith('#'):
+                continue
+            if line.startswith('[') and line.endswith(']'):
+                section = line[1:-1].strip()
+                if section == 'Spots' or section.startswith('Spots_'):
+                    character = None
+                elif section.startswith('Character:'):
+                    character = section[len('Character:'):].strip()
+                    if character != current_character and character not in new_chars:
+                        new_chars[character] = get_default_character_settings()
+                elif section not in ('Settings', 'XControl') and not section.startswith('Hometown:'):
+                    character = section
+                    if character != current_character and character not in new_chars:
+                        new_chars[character] = get_default_character_settings()
+                else:
+                    character = None
+                continue
+
+            if section == 'Spots' or section.startswith('Spots_'):
+                parts = line.split('|')
+                if len(parts) == 8:
+                    try:
+                        race = parts[0]
+                        if race in ['Europe', 'Chinese', 'All']:
+                            level = max(1, min(255, int(parts[1])))
+                            name = parts[2] if parts[2] else 'Unnamed'
+                            parsed_spot = {
+                                'race': race,
+                                'level': level,
+                                'name': name,
+                                'r': int(parts[3]),
+                                'x': int(parts[4]),
+                                'y': int(parts[5]),
+                                'z': int(parts[6]),
+                                'radius': max(0, min(255, int(parts[7])))
+                            }
+                            sec_list = spots_by_section.setdefault(section, [])
+                            if not any(s['r'] == parsed_spot['r'] and s['x'] == parsed_spot['x'] and s['y'] == parsed_spot['y'] and s['z'] == parsed_spot['z'] for s in sec_list):
+                                sec_list.append(parsed_spot)
+                    except Exception:
+                        pass
+                continue
+
+            if character and character in new_chars:
+                c_set = new_chars[character]
+                if '=' in line:
+                    k, v = line.split('=', 1)
+                    k = k.strip()
+                    v = v.strip()
+                    if k == 'enabled': c_set['enabled'] = (v == '1')
+                    elif k == 'spot_mode': c_set['spot_mode'] = v.lower()
+                    elif k == 'last_server_db': c_set['last_server_db'] = v
+                    elif k == 'hometown_enabled': c_set['hometown_enabled'] = (v == '1')
+                    elif k == 'buy_items_enabled': c_set['buy_items_enabled'] = (v == '1')
+                    elif k == 'buy_keep_town_gold_enabled': c_set['buy_keep_town_gold_enabled'] = (v == '1')
+                    elif k == 'buy_gold_threshold':
+                        try: c_set['buy_gold_threshold'] = max(0, int(v))
+                        except Exception: c_set['buy_gold_threshold'] = 0
+                    elif k == 'bought_items':
+                        c_set['bought_items'] = [item.strip() for item in v.split(',') if item.strip()]
+                    elif k == 'solo': c_set['solo'] = (v == '1')
+                    elif k == 'members':
+                        try: c_set['members'] = max(1, min(8, int(v)))
+                        except Exception: c_set['members'] = 8
+                    elif k == 'levelOffset':
+                        try: c_set['levelOffset'] = max(-255, min(255, int(v)))
+                        except Exception: c_set['levelOffset'] = 0
+                    elif k == 'xcontrol_enabled': c_set['xcontrol_enabled'] = (v == '1')
+                    elif k == 'xcontrol_stop': c_set['xcontrol_stop_command'] = v
+                    elif k == 'xcontrol_stopDelayMs': c_set['xcontrol_stop_delay_ms'] = clamp_delay(v)
+                    elif k == 'xcontrol_setpos': c_set['xcontrol_setpos_command'] = v
+                    elif k == 'xcontrol_setrange': c_set['xcontrol_setrange_command'] = v
+                    elif k == 'xcontrol_startDelayMs': c_set['xcontrol_start_delay_ms'] = clamp_delay(v)
+                    elif k == 'xcontrol_start': c_set['xcontrol_start_command'] = v
+                elif '|' in line:
+                    parts = line.split('|')
+                    if len(parts) >= 4:
+                        rules = loaded_hometown.setdefault(character, _hometown_copy_defaults())
+                        try:
+                            idx = int(parts[0])
+                            if 0 <= idx < len(HOMETOWN_DEFAULTS):
+                                rules[idx]['enabled'] = (parts[1] == '1')
+                                rules[idx]['race'] = parts[2] if parts[2] in _hometown_race_options() else HOMETOWN_DEFAULTS[idx]['race']
+                                rules[idx]['level'] = max(0, min(255, int(parts[3])))
+                                if len(parts) >= 5 and rules[idx].get('custom_town') and parts[4] in _hometown_town_options():
+                                    rules[idx]['town'] = parts[4]
+                                    town_base = next((r for r in HOMETOWN_DEFAULTS if not r.get('custom_town') and r['town'] == parts[4]), HOMETOWN_DEFAULTS[0])
+                                    rules[idx]['teleport'] = tuple(town_base['teleport'])
+                                    rules[idx]['spawn'] = tuple(town_base['spawn'])
+                        except Exception:
+                            pass
+
+        for c_name, r_list in loaded_hometown.items():
+            if c_name in new_chars:
+                new_chars[c_name]['hometown_rules'] = r_list
+
+        for c_name, c_data in new_chars.items():
+            if c_name != current_character:
+                character_settings[c_name] = c_data
+
+        config_last_mtime = current_mtime
+    except Exception:
+        pass
+
 def save_config():
+    global config_last_mtime
     try:
         if current_character:
             read_xcontrol_tab1()
             save_character_settings()
 
         directory = os.path.dirname(CONFIG_FILE)
-        if not os.path.exists(directory):
+        if directory and not os.path.exists(directory):
             os.makedirs(directory)
-        with open(CONFIG_FILE, 'w', encoding='utf-8') as f:
-            f.write('[Settings]\n')
-            f.write('use_monstername_as_name=%d\n' % (1 if use_monstername_as_name else 0))
-            f.write('use_mob_level=%d\n' % (1 if use_mob_level else 0))
-            f.write('\n')
 
-            for character in list(character_settings):
-                settings = character_settings[character]
-                if not isinstance(settings, dict):
-                    log('%s: Repairing invalid settings for [%s].' % (Plugin, character))
-                    settings = get_default_character_settings()
-                    character_settings[character] = settings
-                f.write('[%s]\n' % character)
-                f.write('enabled=%d\n' % (1 if settings['enabled'] else 0))
-                f.write('hometown_enabled=%d\n' % (1 if settings.get('hometown_enabled', True) else 0))
-                f.write('buy_items_enabled=%d\n' % (1 if settings.get('buy_items_enabled', False) else 0))
-                f.write('buy_keep_town_gold_enabled=%d\n' % (1 if settings.get('buy_keep_town_gold_enabled', False) else 0))
+        _merge_external_config()
+
+        temp_file = '%s.%d.tmp' % (CONFIG_FILE, os.getpid())
+        for attempt in range(10):
+            try:
+                with open(temp_file, 'w', encoding='utf-8') as f:
+                    f.write('[Settings]\n')
+                    f.write('use_monstername_as_name=%d\n' % (1 if use_monstername_as_name else 0))
+                    f.write('use_mob_level=%d\n' % (1 if use_mob_level else 0))
+                    f.write('\n')
+
+                    for character in sorted(list(character_settings)):
+                        settings = character_settings[character]
+                        if not isinstance(settings, dict):
+                            settings = get_default_character_settings()
+                            character_settings[character] = settings
+                        f.write('[%s]\n' % character)
+                        f.write('enabled=%d\n' % (1 if settings.get('enabled') else 0))
+                        f.write('spot_mode=%s\n' % str(settings.get('spot_mode', 'global')))
+                        if settings.get('last_server_db'):
+                            f.write('last_server_db=%s\n' % str(settings['last_server_db']))
+                        f.write('hometown_enabled=%d\n' % (1 if settings.get('hometown_enabled', True) else 0))
+                        f.write('buy_items_enabled=%d\n' % (1 if settings.get('buy_items_enabled', False) else 0))
+                        f.write('buy_keep_town_gold_enabled=%d\n' % (1 if settings.get('buy_keep_town_gold_enabled', False) else 0))
+                        try:
+                            threshold = max(0, int(settings.get('buy_gold_threshold', 0)))
+                        except Exception:
+                            threshold = 0
+                        f.write('buy_gold_threshold=%d\n' % threshold)
+                        bought_names = []
+                        for item_name in settings.get('bought_items', []):
+                            item_name = str(item_name or '').strip()
+                            if item_name and not item_name.isdigit() and item_name not in bought_names:
+                                bought_names.append(item_name)
+                        f.write('bought_items=%s\n' % ','.join(bought_names))
+                        f.write('solo=%d\n' % (1 if settings.get('solo') else 0))
+                        f.write('members=%d\n' % settings.get('members', 8))
+                        f.write('levelOffset=%d\n' % settings.get('levelOffset', 0))
+                        f.write('xcontrol_enabled=%d\n' % (1 if settings.get('xcontrol_enabled', False) else 0))
+                        f.write('xcontrol_stop=%s\n' % str(settings.get('xcontrol_stop_command', 'STOP')).replace('\n', ' '))
+                        f.write('xcontrol_stopDelayMs=%d\n' % clamp_delay(settings.get('xcontrol_stop_delay_ms', 500)))
+                        f.write('xcontrol_setpos=%s\n' % str(settings.get('xcontrol_setpos_command', 'SETPOS x% y% r% z%')).replace('\n', ' '))
+                        f.write('xcontrol_setrange=%s\n' % str(settings.get('xcontrol_setrange_command', 'SETRADIUS %Range')).replace('\n', ' '))
+                        f.write('xcontrol_startDelayMs=%d\n' % clamp_delay(settings.get('xcontrol_start_delay_ms', 500)))
+                        f.write('xcontrol_start=%s\n' % str(settings.get('xcontrol_start_command', 'START')).replace('\n', ' '))
+
+                        rules = settings.get('hometown_rules')
+                        if not isinstance(rules, list) or len(rules) != len(HOMETOWN_DEFAULTS):
+                            rules = _hometown_character_defaults()['hometown_rules']
+                            settings['hometown_rules'] = rules
+                        for idx, rule in enumerate(rules):
+                            if not isinstance(rule, dict):
+                                rule = HOMETOWN_DEFAULTS[idx]
+                            enabled_value = 1 if bool(rule.get('enabled', False)) else 0
+                            race_value = str(rule.get('race', HOMETOWN_DEFAULTS[idx]['race']))
+                            if race_value not in ('Chinese', 'Europe', 'All'):
+                                race_value = HOMETOWN_DEFAULTS[idx]['race']
+                            level_value = max(0, min(255, int(rule.get('level', HOMETOWN_DEFAULTS[idx]['level']))))
+                            town_value = str(rule.get('town', HOMETOWN_DEFAULTS[idx]['town'])).replace('|', ' ')
+                            f.write('%d|%d|%s|%d|%s\n' % (idx, enabled_value, race_value, level_value, town_value))
+                        f.write('\n')
+
+                    # Write [Spots]
+                    f.write('[Spots]\n')
+                    global_spots = spots_by_section.get('Spots', [])
+                    global_spots.sort(key=lambda s: (s['level'], s['race']))
+                    for spot in global_spots:
+                        safe_name = str(spot.get('name', 'Unnamed')).replace('|', '/')
+                        f.write('%s|%d|%s|%d|%d|%d|%d|%d\n' %
+                            (spot['race'], spot['level'], safe_name, spot['r'], spot['x'], spot['y'], spot['z'], spot['radius']))
+                    f.write('\n')
+
+                    # Write all [Spots_*]
+                    for sec_name in sorted(spots_by_section.keys()):
+                        if sec_name == 'Spots' or not sec_name.startswith('Spots_'):
+                            continue
+                        f.write('[%s]\n' % sec_name)
+                        sec_spots = spots_by_section[sec_name]
+                        sec_spots.sort(key=lambda s: (s['level'], s['race']))
+                        for spot in sec_spots:
+                            safe_name = str(spot.get('name', 'Unnamed')).replace('|', '/')
+                            f.write('%s|%d|%s|%d|%d|%d|%d|%d\n' %
+                                (spot['race'], spot['level'], safe_name, spot['r'], spot['x'], spot['y'], spot['z'], spot['radius']))
+                        f.write('\n')
+
+                os.replace(temp_file, CONFIG_FILE)
                 try:
-                    threshold = max(0, int(settings.get('buy_gold_threshold', 0)))
+                    config_last_mtime = os.path.getmtime(CONFIG_FILE)
                 except Exception:
-                    threshold = 0
-                f.write('buy_gold_threshold=%d\n' % threshold)
-                bought_names = []
-                for item_name in settings.get('bought_items', []):
-                    item_name = str(item_name or '').strip()
-                    if item_name and not item_name.isdigit() and item_name not in bought_names:
-                        bought_names.append(item_name)
-                f.write('bought_items=%s\n' % ','.join(bought_names))
-                f.write('solo=%d\n' % (1 if settings['solo'] else 0))
-                f.write('members=%d\n' % settings['members'])
-                f.write('levelOffset=%d\n' % settings['levelOffset'])
-                f.write('xcontrol_enabled=%d\n' % (1 if settings.get('xcontrol_enabled', False) else 0))
-                f.write('xcontrol_stop=%s\n' % str(settings.get('xcontrol_stop_command', 'STOP')).replace('\\n', ' '))
-                f.write('xcontrol_stopDelayMs=%d\n' % clamp_delay(settings.get('xcontrol_stop_delay_ms', 500)))
-                f.write('xcontrol_setpos=%s\n' % str(settings.get('xcontrol_setpos_command', 'SETPOS x% y% r% z%')).replace('\\n', ' '))
-                f.write('xcontrol_setrange=%s\n' % str(settings.get('xcontrol_setrange_command', 'SETRADIUS %Range')).replace('\\n', ' '))
-                f.write('xcontrol_startDelayMs=%d\n' % clamp_delay(settings.get('xcontrol_start_delay_ms', 500)))
-                f.write('xcontrol_start=%s\n' % str(settings.get('xcontrol_start_command', 'START')).replace('\\n', ' '))
-
-                rules = settings.get('hometown_rules')
-                if not isinstance(rules, list) or len(rules) != len(HOMETOWN_DEFAULTS):
-                    rules = _hometown_character_defaults()['hometown_rules']
-                    settings['hometown_rules'] = rules
-                for idx, rule in enumerate(rules):
-                    if not isinstance(rule, dict):
-                        rule = _hometown_character_defaults()['hometown_rules'][idx]
-                        rules[idx] = rule
-                    try:
-                        enabled_value = 1 if bool(rule.get('enabled', False)) else 0
-                        race_value = str(rule.get('race', HOMETOWN_DEFAULTS[idx]['race']))
-                        if race_value not in ('Chinese', 'Europe', 'All'):
-                            race_value = HOMETOWN_DEFAULTS[idx]['race']
-                        level_value = max(0, min(255, int(rule.get('level', HOMETOWN_DEFAULTS[idx]['level']))))
-                    except Exception:
-                        base = HOMETOWN_DEFAULTS[idx]
-                        enabled_value = 1 if bool(base.get('enabled', False)) else 0
-                        race_value = base.get('race', 'All')
-                        level_value = int(base.get('level', 0))
-                    town_value = str(rule.get('town', HOMETOWN_DEFAULTS[idx]['town'])).replace('|', ' ')
-                    f.write('%d|%d|%s|%d|%s\n' % (idx, enabled_value, race_value, level_value, town_value))
-                f.write('\n')
-
-            f.write('[Spots]\n')
-            spots.sort(key=lambda s: (s['level'], s['race']))
-            for spot in spots:
-                safe_name = spot['name'].replace('|', '/')
-                f.write('%s|%d|%s|%d|%d|%d|%d|%d\n' %
-                    (spot['race'], spot['level'], safe_name, spot['r'], spot['x'], spot['y'], spot['z'], spot['radius']))
+                    pass
+                break
+            except (IOError, OSError):
+                time.sleep(0.02 + random.uniform(0.01, 0.05))
+        else:
+            try:
+                if os.path.exists(temp_file):
+                    os.remove(temp_file)
+            except Exception:
+                pass
     except Exception as ex:
         log('%s: Error saving configuration: %s' % (Plugin, ex))
 
 def load_config():
     global spots
+    global spots_by_section
     global character_settings
     global use_monstername_as_name
     global use_mob_level
+    global config_last_mtime
 
     spots = []
+    spots_by_section = {'Spots': []}
     character_settings = {}
     use_monstername_as_name = False
     use_mob_level = False
     QtBind.setChecked(tab1, checkMonsterName, False)
     QtBind.setChecked(tab1, checkMobLevel, False)
 
-    legacy_xcontrol = {
-        'xcontrol_enabled': False,
-        'xcontrol_stop_command': 'STOP',
-        'xcontrol_stop_delay_ms': 500,
-        'xcontrol_setpos_command': 'SETPOS x% y% r% z%',
-        'xcontrol_setrange_command': 'SETRADIUS %Range',
-        'xcontrol_start_delay_ms': 500,
-        'xcontrol_start_command': 'START'
-    }
-    legacy_xcontrol_found = False
-    character_xcontrol_explicit = set()
     loaded_hometown = {}
-    legacy_character_sections = set()
-    legacy_hometown_sections = set()
-    separate_hometown_sections = set()
 
     if not os.path.exists(CONFIG_FILE):
         save_config()
         refresh_spot_list()
         return
+
     try:
         with open(CONFIG_FILE, 'r', encoding='utf-8') as f:
             lines = f.readlines()
@@ -1418,16 +1806,12 @@ def load_config():
             if not line or line.startswith('#'):
                 continue
             if line.startswith('[') and line.endswith(']'):
-                section = line[1:-1]
+                section = line[1:-1].strip()
                 if section.startswith('Character:'):
-                    legacy_name = section[len('Character:'):].strip()
-                    legacy_character_sections.add(legacy_name)
-                    character = get_character_key(legacy_name) if legacy_name == get_character_name() else legacy_name
+                    character = section[len('Character:'):].strip()
                     if character not in character_settings:
                         character_settings[character] = get_default_character_settings()
-                elif section not in ('Settings', 'Spots', 'XControl') and not section.startswith('Hometown:'):
-                    if '_' not in section:
-                        legacy_character_sections.add(section)
+                elif section not in ('Settings', 'Spots', 'XControl') and not section.startswith('Spots_') and not section.startswith('Hometown:'):
                     character = section
                     if character not in character_settings:
                         character_settings[character] = get_default_character_settings()
@@ -1435,225 +1819,106 @@ def load_config():
                     character = None
                 continue
 
-            if section == 'Settings':
+            if section == 'Settings' and '=' in line:
+                k, v = line.split('=', 1)
+                k = k.strip()
+                v = v.strip()
+                if k == 'use_monstername_as_name':
+                    use_monstername_as_name = (v == '1')
+                    QtBind.setChecked(tab1, checkMonsterName, use_monstername_as_name)
+                elif k == 'use_mob_level':
+                    use_mob_level = (v == '1')
+                    QtBind.setChecked(tab1, checkMobLevel, use_mob_level)
+                continue
+
+            if character and character in character_settings:
+                c_set = character_settings[character]
                 if '=' in line:
-                    key, value = line.split('=', 1)
-                    if key.strip() == 'use_monstername_as_name':
-                        use_monstername_as_name = value.strip() == '1'
-                        QtBind.setChecked(tab1, checkMonsterName, use_monstername_as_name)
-                    elif key.strip() == 'use_mob_level':
-                        use_mob_level = value.strip() == '1'
-                        QtBind.setChecked(tab1, checkMobLevel, use_mob_level)
-                continue
-
-            if character is not None and (section.startswith('Character:') or (section not in ('Settings', 'Spots', 'XControl') and not section.startswith('Hometown:'))):
-                if '=' not in line:
-                    if '|' in line:
-                        rules = loaded_hometown.setdefault(character, _hometown_copy_defaults())
-                        try:
-                            parts = line.split('|')
-                            if len(parts) >= 4:
-                                idx = int(parts[0])
-                                if 0 <= idx < len(HOMETOWN_DEFAULTS):
-                                    rules[idx]['enabled'] = parts[1] == '1'
-                                    rules[idx]['race'] = parts[2] if parts[2] in _hometown_race_options() else HOMETOWN_DEFAULTS[idx]['race']
-                                    rules[idx]['level'] = max(0, min(255, int(parts[3])))
-                                    if len(parts) >= 5 and rules[idx].get('custom_town') and parts[4] in _hometown_town_options():
-                                        rules[idx]['town'] = parts[4]
-                                        town_base = next((r for r in HOMETOWN_DEFAULTS if not r.get('custom_town') and r['town'] == parts[4]), HOMETOWN_DEFAULTS[0])
-                                        rules[idx]['teleport'] = tuple(town_base['teleport'])
-                                        rules[idx]['spawn'] = tuple(town_base['spawn'])
-                        except Exception:
-                            pass
-                    continue
-                key, value = line.split('=', 1)
-                value = value.strip()
-                if key == 'enabled':
-                    character_settings[character]['enabled'] = (value == '1')
-                elif key == 'hometown_enabled':
-                    character_settings[character]['hometown_enabled'] = (value == '1')
-                elif key == 'buy_items_enabled':
-                    character_settings[character]['buy_items_enabled'] = (value == '1')
-                elif key == 'buy_keep_town_gold_enabled':
-                    character_settings[character]['buy_keep_town_gold_enabled'] = (value == '1')
-                elif key == 'buy_gold_threshold':
-                    try:
-                        character_settings[character]['buy_gold_threshold'] = max(0, int(value))
-                    except Exception:
-                        character_settings[character]['buy_gold_threshold'] = 0
-                elif key == 'bought_items':
-                    names = []
-                    for raw_name in value.split(','):
-                        item_name = raw_name.strip()
-                        if item_name and item_name not in names:
-                            names.append(item_name)
-                    character_settings[character]['bought_items'] = names
-                elif key == 'solo':
-                    character_settings[character]['solo'] = (value == '1')
-                elif key == 'members':
-                    try:
-                        character_settings[character]['members'] = max(1, min(8, int(value)))
-                    except:
-                        character_settings[character]['members'] = 8
-                elif key == 'levelOffset':
-                    try:
-                        character_settings[character]['levelOffset'] = max(-255, min(255, int(value)))
-                    except:
-                        character_settings[character]['levelOffset'] = 0
-                elif key == 'xcontrol_enabled':
-                    character_settings[character]['xcontrol_enabled'] = (value == '1')
-                    character_xcontrol_explicit.add(character)
-                elif key == 'xcontrol_stop':
-                    character_settings[character]['xcontrol_stop_command'] = value
-                    character_xcontrol_explicit.add(character)
-                elif key == 'xcontrol_stopDelayMs':
-                    character_settings[character]['xcontrol_stop_delay_ms'] = clamp_delay(value)
-                    character_xcontrol_explicit.add(character)
-                elif key == 'xcontrol_setpos':
-                    character_settings[character]['xcontrol_setpos_command'] = value
-                    character_xcontrol_explicit.add(character)
-                elif key == 'xcontrol_setrange':
-                    character_settings[character]['xcontrol_setrange_command'] = value
-                    character_xcontrol_explicit.add(character)
-                elif key == 'xcontrol_startDelayMs':
-                    character_settings[character]['xcontrol_start_delay_ms'] = clamp_delay(value)
-                    character_xcontrol_explicit.add(character)
-                elif key == 'xcontrol_start':
-                    character_settings[character]['xcontrol_start_command'] = value
-                    character_xcontrol_explicit.add(character)
-                continue
-
-            if section == 'XControl':
-                if '=' not in line:
-                    continue
-                key, value = line.split('=', 1)
-                value = value.strip()
-                legacy_xcontrol_found = True
-                if key == 'enabled':
-                    legacy_xcontrol['xcontrol_enabled'] = (value == '1')
-                elif key == 'stop':
-                    legacy_xcontrol['xcontrol_stop_command'] = value
-                elif key == 'stopDelayMs':
-                    legacy_xcontrol['xcontrol_stop_delay_ms'] = clamp_delay(value)
-                elif key == 'setpos':
-                    legacy_xcontrol['xcontrol_setpos_command'] = value
-                elif key == 'setrange':
-                    legacy_xcontrol['xcontrol_setrange_command'] = value
-                elif key == 'startDelayMs':
-                    legacy_xcontrol['xcontrol_start_delay_ms'] = clamp_delay(value)
-                elif key == 'start':
-                    legacy_xcontrol['xcontrol_start_command'] = value
-                continue
-
-            if section.startswith('Hometown:'):
-                hometown_character = section.split(':', 1)[1]
-                separate_hometown_sections.add(hometown_character)
-                if '_' not in hometown_character:
-                    legacy_hometown_sections.add(hometown_character)
-                rules = loaded_hometown.setdefault(hometown_character, _hometown_copy_defaults())
-                try:
+                    k, v = line.split('=', 1)
+                    k = k.strip()
+                    v = v.strip()
+                    if k == 'enabled': c_set['enabled'] = (v == '1')
+                    elif k == 'spot_mode': c_set['spot_mode'] = v.lower()
+                    elif k == 'last_server_db': c_set['last_server_db'] = v
+                    elif k == 'hometown_enabled': c_set['hometown_enabled'] = (v == '1')
+                    elif k == 'buy_items_enabled': c_set['buy_items_enabled'] = (v == '1')
+                    elif k == 'buy_keep_town_gold_enabled': c_set['buy_keep_town_gold_enabled'] = (v == '1')
+                    elif k == 'buy_gold_threshold':
+                        try: c_set['buy_gold_threshold'] = max(0, int(v))
+                        except Exception: c_set['buy_gold_threshold'] = 0
+                    elif k == 'bought_items':
+                        c_set['bought_items'] = [item.strip() for item in v.split(',') if item.strip()]
+                    elif k == 'solo': c_set['solo'] = (v == '1')
+                    elif k == 'members':
+                        try: c_set['members'] = max(1, min(8, int(v)))
+                        except Exception: c_set['members'] = 8
+                    elif k == 'levelOffset':
+                        try: c_set['levelOffset'] = max(-255, min(255, int(v)))
+                        except Exception: c_set['levelOffset'] = 0
+                    elif k == 'xcontrol_enabled': c_set['xcontrol_enabled'] = (v == '1')
+                    elif k == 'xcontrol_stop': c_set['xcontrol_stop_command'] = v
+                    elif k == 'xcontrol_stopDelayMs': c_set['xcontrol_stop_delay_ms'] = clamp_delay(v)
+                    elif k == 'xcontrol_setpos': c_set['xcontrol_setpos_command'] = v
+                    elif k == 'xcontrol_setrange': c_set['xcontrol_setrange_command'] = v
+                    elif k == 'xcontrol_startDelayMs': c_set['xcontrol_start_delay_ms'] = clamp_delay(v)
+                    elif k == 'xcontrol_start': c_set['xcontrol_start_command'] = v
+                elif '|' in line:
                     parts = line.split('|')
                     if len(parts) >= 4:
-                        idx = int(parts[0])
-                        if 0 <= idx < len(HOMETOWN_DEFAULTS):
-                            rules[idx]['enabled'] = parts[1] == '1'
-                            rules[idx]['race'] = parts[2] if parts[2] in _hometown_race_options() else HOMETOWN_DEFAULTS[idx]['race']
-                            rules[idx]['level'] = max(0, min(255, int(parts[3])))
-                            if len(parts) >= 5 and rules[idx].get('custom_town') and parts[4] in _hometown_town_options():
-                                rules[idx]['town'] = parts[4]
-                                town_base = next((r for r in HOMETOWN_DEFAULTS if not r.get('custom_town') and r['town'] == parts[4]), HOMETOWN_DEFAULTS[0])
-                                rules[idx]['teleport'] = tuple(town_base['teleport'])
-                                rules[idx]['spawn'] = tuple(town_base['spawn'])
-                except Exception:
-                    pass
+                        rules = loaded_hometown.setdefault(character, _hometown_copy_defaults())
+                        try:
+                            idx = int(parts[0])
+                            if 0 <= idx < len(HOMETOWN_DEFAULTS):
+                                rules[idx]['enabled'] = (parts[1] == '1')
+                                rules[idx]['race'] = parts[2] if parts[2] in _hometown_race_options() else HOMETOWN_DEFAULTS[idx]['race']
+                                rules[idx]['level'] = max(0, min(255, int(parts[3])))
+                                if len(parts) >= 5 and rules[idx].get('custom_town') and parts[4] in _hometown_town_options():
+                                    rules[idx]['town'] = parts[4]
+                                    town_base = next((r for r in HOMETOWN_DEFAULTS if not r.get('custom_town') and r['town'] == parts[4]), HOMETOWN_DEFAULTS[0])
+                                    rules[idx]['teleport'] = tuple(town_base['teleport'])
+                                    rules[idx]['spawn'] = tuple(town_base['spawn'])
+                        except Exception:
+                            pass
                 continue
 
-            if section == 'Spots':
+            if section == 'Spots' or section.startswith('Spots_'):
                 parts = line.split('|')
-                if len(parts) != 8:
-                    continue
-                try:
-                    race = parts[0]
-                    if race not in ['Europe', 'Chinese', 'All']:
-                        continue
-                    level = max(1, min(255, int(parts[1])))
-                    name = parts[2] if parts[2] else 'Unnamed'
-                    spots.append({
-                        'race': race,
-                        'level': level,
-                        'name': name,
-                        'r': int(parts[3]),
-                        'x': int(parts[4]),
-                        'y': int(parts[5]),
-                        'z': int(parts[6]),
-                        'radius': max(0, min(255, int(parts[7])))
-                    })
-                except:
-                    log('%s: Invalid spot line: %s' % (Plugin, line))
+                if len(parts) == 8:
+                    try:
+                        race = parts[0]
+                        if race in ['Europe', 'Chinese', 'All']:
+                            level = max(1, min(255, int(parts[1])))
+                            name = parts[2] if parts[2] else 'Unnamed'
+                            spot_item = {
+                                'race': race,
+                                'level': level,
+                                'name': name,
+                                'r': int(parts[3]),
+                                'x': int(parts[4]),
+                                'y': int(parts[5]),
+                                'z': int(parts[6]),
+                                'radius': max(0, min(255, int(parts[7])))
+                            }
+                            spots_by_section.setdefault(section, []).append(spot_item)
+                    except Exception:
+                        pass
 
-        migrated_character_sections = False
+        for c_name, r_list in loaded_hometown.items():
+            if c_name in character_settings:
+                character_settings[c_name]['hometown_rules'] = r_list
 
-        def _resolve_legacy_character_key(name):
-            name = str(name or '').strip()
-            if not name:
-                return name
-            live_name = get_character_name()
-            if live_name and name == live_name:
-                return get_character_key(live_name) or name
-            suffix = '_' + name
-            matches = [key for key in character_settings if key.endswith(suffix) and key != name]
-            if len(matches) == 1:
-                return matches[0]
-            return name
+        for s_list in spots_by_section.values():
+            s_list.sort(key=lambda s: (s['level'], s['race']))
 
-        for legacy_name in list(legacy_character_sections):
-            target_key = _resolve_legacy_character_key(legacy_name)
-            if target_key == legacy_name:
-                continue
-            legacy_settings = character_settings.pop(legacy_name, {})
-            target_existed = target_key in character_settings
-            if not target_existed and isinstance(legacy_settings, dict):
-                character_settings[target_key] = legacy_settings
-            else:
-                target_settings = character_settings.setdefault(target_key, get_default_character_settings())
-                if isinstance(legacy_settings, dict):
-                    for key, value in legacy_settings.items():
-                        if key not in target_settings:
-                            target_settings[key] = value
-            if target_key != legacy_name:
-                migrated_character_sections = True
+        try:
+            config_last_mtime = os.path.getmtime(CONFIG_FILE)
+        except Exception:
+            config_last_mtime = None
 
-        normalized_hometown = {}
-        for hometown_name, rules in loaded_hometown.items():
-            target_key = _resolve_legacy_character_key(hometown_name)
-            if target_key not in normalized_hometown or '_' in hometown_name:
-                normalized_hometown[target_key] = rules
-        loaded_hometown = normalized_hometown
-        if any(_resolve_legacy_character_key(name) != name for name in legacy_hometown_sections):
-            migrated_character_sections = True
-        if any('_' in name or _resolve_legacy_character_key(name) != name for name in separate_hometown_sections):
-            migrated_character_sections = True
-
-        for hometown_character, rules in loaded_hometown.items():
-            if hometown_character not in character_settings:
-                character_settings[hometown_character] = get_default_character_settings()
-            character_settings[hometown_character]['hometown_rules'] = rules
-
-        migrated_legacy_xcontrol = False
-        if legacy_xcontrol_found:
-            for character in character_settings:
-                settings = character_settings[character]
-                if character not in character_xcontrol_explicit:
-                    settings.update(legacy_xcontrol)
-                    migrated_legacy_xcontrol = True
-
-        spots.sort(key=lambda s: (s['level'], s['race']))
-
-        if migrated_legacy_xcontrol or migrated_character_sections:
-            save_config()
-
-        refresh_spot_list()
-        log('%s: Loaded %d spots and %d character settings.' % (Plugin, len(spots), len(character_settings)))
+        update_active_spots()
+        total_spots_count = sum(len(s) for s in spots_by_section.values())
+        log('%s: Loaded %d spots across %d sections and %d character settings.' %
+            (Plugin, total_spots_count, len(spots_by_section), len(character_settings)))
     except Exception as ex:
         log('%s: Error loading configuration: %s' % (Plugin, ex))
 
@@ -2001,26 +2266,8 @@ def calc_sp_clicked():
 # ============================================================
 # Auto Buy Items & Town Loop Gold Calculation
 # ============================================================
-cached_db_path = None
-
 def _buy_items_db_path(client_path):
-    global cached_db_path
-    if cached_db_path and os.path.exists(cached_db_path):
-        return cached_db_path
-        
-    plugin_dir = os.path.dirname(os.path.abspath(__file__))
-    data_dir = os.path.abspath(os.path.join(plugin_dir, '..', 'Data'))
-    for candidate in glob.glob(os.path.join(data_dir, '*.db3')):
-        try:
-            conn = sqlite3.connect(candidate)
-            row = conn.execute("SELECT v FROM data WHERE k='path' LIMIT 1").fetchone()
-            conn.close()
-            if row and str(row[0]).rstrip('\\/').lower() == str(client_path).rstrip('\\/').lower():
-                cached_db_path = candidate
-                return candidate
-        except Exception:
-            pass
-    return None
+    return find_client_db3_path(client_path)
 
 def _buy_items_inventory_count(item_id=0, item_servername=''):
     """Count total quantity of an item across all inventory slots (including split stacks)."""
@@ -2712,7 +2959,7 @@ def _buy_items_loop():
             log('%s: Buy items: %s endpoint reached (X/Y tolerance +/-3); preparing to buy in 2 seconds.' %
                 (Plugin, segment.get('name', 'Town segment')))
         elif now - state.get('started', now) > 120.0:
-            # 120 Sekunden Timeout, falls der Punkt nicht erreicht wird
+            # 120 seconds timeout if target not reached
             log('%s: Buy items: %s timeout (120s) reached before endpoint; continuing.' % (Plugin, segment.get('name', 'Town segment')))
             state['phase'] = 'endpoint_delay'
             state['started'] = now
@@ -2725,7 +2972,7 @@ def _buy_items_loop():
         segment = state.get('active_segment') or {}
         endpoint = segment.get('endpoint') or (0, 0, 0)
 
-        # Regionen-Check entfernt, da der phBot nun den Weg eigenständig findet
+        # Region check removed since phBot paths independently
 
         try:
             db_path = _buy_items_db_path((get_client() or {}).get('path', ''))
@@ -3160,6 +3407,10 @@ def _hometown_retry_or_disable():
 
 def _auto_save_tab1_settings():
     global auto_settings_signature
+    global enabled
+    global solo
+    global members
+    global levelOffset
     global BUY_GOLD_THRESHOLD
     global buy_keep_town_gold_enabled
 
@@ -3179,7 +3430,8 @@ def _auto_save_tab1_settings():
             QtBind.text(tab1, editXControlDelay2),
             QtBind.text(tab1, editXControlStart),
             QtBind.text(tab2, buy_gold_threshold_edit).strip() if 'buy_gold_threshold_edit' in globals() else '0',
-            bool(QtBind.isChecked(tab2, buy_keep_town_gold_check)) if 'buy_keep_town_gold_check' in globals() else False
+            bool(QtBind.isChecked(tab2, buy_keep_town_gold_check)) if 'buy_keep_town_gold_check' in globals() else False,
+            spot_mode
         )
     except Exception:
         return
@@ -3190,18 +3442,29 @@ def _auto_save_tab1_settings():
         return
     auto_settings_signature = sig
     try:
-        checkEnable_clicked(sig[0])
-        checkSolo_clicked(sig[1])
-        saveMembers_clicked()
-        saveLevelOffset_clicked()
+        enabled = sig[0]
+        solo = sig[1]
+        try:
+            m_val = int(sig[2])
+            members = max(1, min(8, m_val))
+        except Exception:
+            pass
+
+        try:
+            o_val = int(sig[3])
+            levelOffset = max(-255, min(255, o_val))
+        except Exception:
+            pass
+
         read_xcontrol_tab1()
         try:
-            threshold_text = QtBind.text(tab2, buy_gold_threshold_edit).strip()
+            threshold_text = QtBind.text(tab2, buy_gold_threshold_edit).strip() if 'buy_gold_threshold_edit' in globals() else '0'
             threshold_value = max(0, int(threshold_text)) if threshold_text else 0
         except Exception:
             threshold_value = 0
         BUY_GOLD_THRESHOLD = threshold_value
-        QtBind.setText(tab2, buy_gold_threshold_edit, str(threshold_value))
+        if 'buy_gold_threshold_edit' in globals():
+            QtBind.setText(tab2, buy_gold_threshold_edit, str(threshold_value))
         buy_keep_town_gold_enabled = sig[12]
 
         save_character_settings()
@@ -3459,7 +3722,7 @@ def check_for_update():
             if match:
                 online_version_str = match.group(1).strip()
                 
-                # Hilfsfunktion: Macht aus "1.1.2 Beta" -> [1, 1, 2]
+                # Helper function: parses "1.1.2 Beta" -> [1, 1, 2]
                 def parse_v(v_str):
                     v_match = re.search(r'([0-9]+(?:\.[0-9]+)*)', v_str)
                     if v_match:
@@ -3474,7 +3737,7 @@ def check_for_update():
                     log('%s: %s' % (Plugin, msg))
                     log('BetterTraining: https://github.com/chefkoch1837/phBot/blob/main/BetterTraining.py')
                     
-                    # Hier ändern wir den Text des Labels und füllen ihn auf 60 Zeichen auf
+                    # Update label text padded to 60 characters
                     try:
                         QtBind.setText(tab1, lbl_version, msg.ljust(60))
                     except Exception as ui_ex:
@@ -3486,6 +3749,63 @@ def check_for_update():
                 
     except Exception as ex:
         log('%s: Update Check failed: %s' % (Plugin, str(ex)))
+
+def _reload_spots_from_disk():
+    global config_last_mtime
+    global spots_by_section
+    if not os.path.exists(CONFIG_FILE):
+        return
+    try:
+        with open(CONFIG_FILE, 'r', encoding='utf-8') as f:
+            lines = f.readlines()
+
+        new_spots_by_sec = {'Spots': []}
+        section = ''
+
+        for raw_line in lines:
+            line = raw_line.strip()
+            if not line or line.startswith('#'):
+                continue
+            if line.startswith('[') and line.endswith(']'):
+                section = line[1:-1].strip()
+                if section == 'Spots' or section.startswith('Spots_'):
+                    new_spots_by_sec.setdefault(section, [])
+                continue
+
+            if section == 'Spots' or section.startswith('Spots_'):
+                parts = line.split('|')
+                if len(parts) == 8:
+                    try:
+                        race = parts[0]
+                        if race in ['Europe', 'Chinese', 'All']:
+                            level = max(1, min(255, int(parts[1])))
+                            name = parts[2] if parts[2] else 'Unnamed'
+                            spot_item = {
+                                'race': race,
+                                'level': level,
+                                'name': name,
+                                'r': int(parts[3]),
+                                'x': int(parts[4]),
+                                'y': int(parts[5]),
+                                'z': int(parts[6]),
+                                'radius': max(0, min(255, int(parts[7])))
+                            }
+                            new_spots_by_sec.setdefault(section, []).append(spot_item)
+                    except Exception:
+                        pass
+
+        for s_list in new_spots_by_sec.values():
+            s_list.sort(key=lambda s: (s['level'], s['race']))
+
+        spots_by_section = new_spots_by_sec
+        update_active_spots()
+
+        try:
+            config_last_mtime = os.path.getmtime(CONFIG_FILE)
+        except Exception:
+            pass
+    except Exception as ex:
+        log('%s: Error reloading spots from disk: %s' % (Plugin, ex))
 
 def event_loop():
     global buy_items_pending
@@ -3504,7 +3824,7 @@ def event_loop():
 # ============================================================
 load_config()
 Timer(2.0, load_character_settings_when_ready, []).start()
-Timer(5.0, check_for_update, []).start()  # <--- DIESE ZEILE HINZUFÜGEN
+Timer(5.0, check_for_update, []).start()
 
 log('Plugin: %s by Chefkoch, Inspired by Bine11 AutoTraining' % Plugin)
 log('Plugin: %s v%s successfully loaded!' % (Plugin, PluginVersion))
